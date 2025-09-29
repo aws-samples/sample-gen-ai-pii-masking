@@ -2,7 +2,7 @@
 
 A comprehensive collection of AWS serverless solutions for detecting and masking Personally Identifiable Information (PII) using Amazon Bedrock. This repository provides both batch processing and real-time workflow solutions to handle different use cases and data volumes.
 
-## ✅ **Available Solutions**
+## **Available Solutions**
 
 ### 1. Batch Processing Pipeline (`/batch`)
 A secure serverless pipeline for processing CSV files with dual processing capabilities:
