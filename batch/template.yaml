@@ -1,0 +1,768 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless infrastructure for PII detection using Amazon Bedrock batch inference with enhanced security'
+
+Parameters:
+  StackName:
+    Type: String
+    Description: Name for this stack
+    Default: pii-detection-pipeline
+
+  Environment:
+    Type: String
+    Description: Environment name
+    AllowedValues: [dev, staging, prod]
+    Default: prod
+
+  RetentionDays:
+    Type: Number
+    Description: Number of days to retain data
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+
+  CostCenter:
+    Type: String
+    Description: Cost center for billing
+    Default: data-processing
+
+  Project:
+    Type: String
+    Description: Project name
+    Default: pii-detection
+
+  Owner:
+    Type: String
+    Description: Team or individual responsible for the resources
+    Default: data-security-team
+
+  CodeBucketName:
+    Type: String
+    Description: Name of the S3 bucket containing Lambda code and layers
+
+Mappings:
+  CommonTags:
+    Tags:
+      Application: PII-Detection-Pipeline
+      SecurityCompliance: HIPAA-HITECH
+      DataClassification: Confidential
+      AutomatedBy: CloudFormation
+
+Resources:
+  # KMS Keys
+  DataEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    Properties:
+      Description: KMS key for encrypting PII data
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Service Access
+            Effect: Allow
+            Principal:
+              Service: 
+                - s3.amazonaws.com
+                - lambda.amazonaws.com
+                - bedrock.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-data-encryption-key
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: SecurityCompliance
+          Value: !FindInMap [CommonTags, Tags, SecurityCompliance]
+
+  DataEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${StackName}-data-key
+      TargetKeyId: !Ref DataEncryptionKey
+
+  # Lambda Layers
+  Boto3Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${StackName}-boto3-layer
+      Description: Boto3 v1.36.21 for Python 3.12
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: layers/boto3-layer.zip
+
+  PandasLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${StackName}-pandas-layer
+      Description: Pandas and NumPy for Python 3.12
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: layers/pandas-layer.zip
+
+  # S3 Buckets
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub ${StackName}-batch-input-${Environment}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AutoDelete
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-input-bucket
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: PII
+          Value: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref DataEncryptionKey
+              SSEAlgorithm: aws:kms
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: input-bucket-logs/
+
+  InputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnSecureCommunications
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt InputBucket.Arn
+              - !Sub "${InputBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub ${StackName}-batch-output-${Environment}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AutoDelete
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-output-bucket
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: PII
+          Value: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref DataEncryptionKey
+              SSEAlgorithm: aws:kms
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: output-bucket-logs/
+
+  OutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnSecureCommunications
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt OutputBucket.Arn
+              - !Sub "${OutputBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "LoggingBucket is used to store access logs from other S3 buckets. Enabling access logging on the logging bucket itself would create recursive logging and is not recommended."
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "LoggingBucket is used to store access logs from other S3 buckets. Enabling access logging on the logging bucket itself would create recursive logging."
+    Properties:
+      BucketName: !Sub ${StackName}-logs-${Environment}-${AWS::Region}
+      LifecycleConfiguration:
+        Rules:
+          - Id: AutoDelete
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-logging-bucket
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${LoggingBucket.Arn}/*
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt InputBucket.Arn
+                  - !GetAtt OutputBucket.Arn
+          - Sid: S3ServerAccessLogsDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${LoggingBucket.Arn}/*
+
+  # DynamoDB Table
+  JobTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "DynamoDB table name is explicitly set to maintain consistency across deployments and enable predictable resource naming for application configuration."
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "DynamoDB table already encrypted with customer-managed KMS key via SSESpecification configuration."
+    Properties:
+      TableName: !Sub ${StackName}-job-tracking-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref DataEncryptionKey
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: sourceFile
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: SourceFileIndex
+          KeySchema:
+            - AttributeName: sourceFile
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataEncryptionKey
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-job-tracking
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+
+  # IAM Roles
+  BedrockExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/us.amazon.nova-*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${InputBucket.Arn}/*
+                  - !Sub ${OutputBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataEncryptionKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-bedrock-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:GetModelInvocationJob
+                  - bedrock:ListModelInvocationJobs
+                  - bedrock:StopModelInvocationJob
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-job/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/us.amazon.nova-*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt BedrockExecutionRole.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${InputBucket.Arn}/*
+                  - !Sub ${OutputBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataEncryptionKey.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt JobTrackingTable.Arn
+                  - !Sub ${JobTrackingTable.Arn}/index/*
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ProcessorDLQ.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-lambda-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+
+  # Lambda Functions
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with Bedrock service and external APIs without NAT Gateway costs."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function requires internet access for Bedrock API calls."
+          - id: CKV_AWS_115
+            comment: "ReservedConcurrentExecutions already configured (10) to prevent resource exhaustion."
+          - id: CKV_AWS_116
+            comment: "DeadLetterConfig already configured with ProcessorDLQ for error handling."
+          - id: CKV_AWS_173
+            comment: "Environment variables encrypted with customer-managed KMS key via KmsKeyArn property."
+    DependsOn:
+      - InputBucket
+      - OutputBucket
+      - JobTrackingTable
+      - Boto3Layer
+      - PandasLayer
+    Properties:
+      Handler: processor.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt ProcessorDLQ.Arn
+      Layers:
+        - !Ref Boto3Layer
+        - !Ref PandasLayer
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref JobTrackingTable
+          INPUT_BUCKET: !Ref InputBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+          BEDROCK_ROLE_ARN: !GetAtt BedrockExecutionRole.Arn
+          KMS_KEY_ID: !Ref DataEncryptionKey
+          ENVIRONMENT: !Ref Environment
+      KmsKeyArn: !GetAtt DataEncryptionKey.Arn
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: lambda/processor.zip
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-processor
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Application
+          Value: !FindInMap [CommonTags, Tags, Application]
+  
+  # Job Monitoring function
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with Bedrock service for job status monitoring without NAT Gateway costs."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function requires internet access for Bedrock API calls."
+          - id: CKV_AWS_115
+            comment: "ReservedConcurrentExecutions already configured (2) to prevent resource exhaustion."
+          - id: CKV_AWS_116
+            comment: "DeadLetterConfig already configured with ProcessorDLQ for error handling."
+          - id: CKV_AWS_173
+            comment: "Environment variables encrypted with customer-managed KMS key via KmsKeyArn property."
+    DependsOn:
+      - Boto3Layer
+    Properties:
+      Handler: monitor.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 2
+      DeadLetterConfig:
+        TargetArn: !GetAtt ProcessorDLQ.Arn
+      Layers:
+        - !Ref Boto3Layer
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref JobTrackingTable
+          KMS_KEY_ID: !Ref DataEncryptionKey
+          ENVIRONMENT: !Ref Environment
+      KmsKeyArn: !GetAtt DataEncryptionKey.Arn
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: lambda/monitor.zip
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-monitor
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Application
+          Value: !FindInMap [CommonTags, Tags, Application]
+
+  # SQS DLQ
+  ProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${StackName}-processor-dlq-${Environment}
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref DataEncryptionKey
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-processor-dlq
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+
+  # EventBridge Rules
+  ProcessorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger processing for new CSV files"
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: [!Ref InputBucket]
+          object:
+            key: [{"suffix": ".csv"}]
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt ProcessorFunction.Arn
+          Id: "ProcessCSVTarget"
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+          DeadLetterConfig:
+            Arn: !GetAtt ProcessorDLQ.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-processor-rule
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+
+  MonitorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Monitor batch inference jobs"
+      ScheduleExpression: "rate(15 minutes)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt MonitorFunction.Arn
+          Id: "MonitorTarget"
+      Tags:
+        - Key: Name
+          Value: !Sub ${StackName}-monitor-rule
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+
+  # Lambda Permissions
+  ProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ProcessorFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ProcessorRule.Arn
+
+  MonitorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref MonitorFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt MonitorRule.Arn
+
+Outputs:
+  InputBucketName:
+    Description: "Name of the input S3 bucket"
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-InputBucket
+
+  OutputBucketName:
+    Description: "Name of the output S3 bucket"
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-OutputBucket
+
+  JobTrackingTableName:
+    Description: "Name of the DynamoDB job tracking table"
+    Value: !Ref JobTrackingTable
+    Export:
+      Name: !Sub ${AWS::StackName}-JobTrackingTable
+
+  KMSKeyId:
+    Description: "KMS Key ID for data encryption"
+    Value: !Ref DataEncryptionKey
+    Export:
+      Name: !Sub ${AWS::StackName}-KMSKeyId
+
+  ProcessorFunctionArn:
+    Description: "ARN of the processor Lambda function"
+    Value: !GetAtt ProcessorFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ProcessorFunctionArn
+
+  MonitorFunctionArn:
+    Description: "ARN of the monitor Lambda function"
+    Value: !GetAtt MonitorFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-MonitorFunctionArn
+
+  BedrockRoleArn:
+    Description: "ARN of the Bedrock execution role"
+    Value: !GetAtt BedrockExecutionRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-BedrockRoleArn          

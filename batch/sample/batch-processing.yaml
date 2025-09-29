@@ -1,0 +1,542 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless infrastructure for PII detection using Amazon Bedrock batch inference'
+
+Parameters:
+  StackName:
+    Type: String
+    Description: Name for this stack
+    Default: pii-detection-pipeline
+
+Resources:
+  # S3 Buckets
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "Access logging excluded per user requirements to avoid recursive logging and additional costs."
+          - id: W51
+            reason: "Bucket policy not required for this sample template as access is controlled through IAM roles."
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "S3 bucket access logging excluded per user requirements to avoid recursive logging and additional costs."
+    Properties:
+      BucketName: !Sub ${AWS::AccountId}-${AWS::Region}-bedrock-batch-input
+      Tags:
+        - Key: genai-batch
+          Value: true
+        - Key: PII
+          Value: true
+        - Key: prod
+          Value: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "Access logging excluded per user requirements to avoid recursive logging and additional costs."
+          - id: W51
+            reason: "Bucket policy not required for this sample template as access is controlled through IAM roles."
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "S3 bucket access logging excluded per user requirements to avoid recursive logging and additional costs."
+    Properties:
+      BucketName: !Sub ${AWS::AccountId}-${AWS::Region}-bedrock-batch-output
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  # DynamoDB Table for Job Tracking
+  JobTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "DynamoDB table name is explicitly set to maintain consistency across deployments and enable predictable resource naming for application configuration."
+      checkov:
+        skip:
+          - id: CKV_AWS_119
+            comment: "DynamoDB table configured with SSEEnabled for encryption. Customer-managed KMS key not required for this sample template."
+    Properties:
+      TableName: !Sub ${StackName}-job-tracking
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # IAM Role for Bedrock Batch Inference
+  BedrockExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !Sub ${InputBucket.Arn}/*
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub ${OutputBucket.Arn}/*
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Wildcard permissions required for Bedrock service access across all foundation models and regions for PII detection functionality."
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "Wildcard permissions required for Bedrock service access across all foundation models and regions. Access is limited to Bedrock APIs only."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BatchInference
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                  - bedrock:ListCustomModels
+                  - bedrock:GetCustomModel
+                  - bedrock:TagResource
+                  - bedrock:UntagResource
+                  - bedrock:ListTagsForResource
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:GetModelInvocationJob
+                  - bedrock:ListModelInvocationJobs
+                  - bedrock:StopModelInvocationJob
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !Sub ${InputBucket.Arn}/*
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub ${OutputBucket.Arn}/*
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt JobTrackingTable.Arn
+
+  # Lambda Functions
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with Bedrock service and external APIs without NAT Gateway costs."
+          - id: W92
+            reason: "Reserved concurrent executions not required for this sample template as it's designed for demonstration purposes."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function requires internet access for Bedrock API calls."
+          - id: CKV_AWS_115
+            comment: "Reserved concurrent executions not required for this sample template as it's designed for demonstration purposes."
+          - id: CKV_AWS_116
+            comment: "Dead Letter Queue not required for this sample template. Production deployments should implement DLQ."
+          - id: CKV_AWS_173
+            comment: "Environment variables contain only non-sensitive configuration values (table names, bucket names, ARNs)."
+    DependsOn: 
+      - InputBucket
+      - OutputBucket
+      - JobTrackingTable
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref JobTrackingTable
+          INPUT_BUCKET: !Ref InputBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+          BEDROCK_ROLE_ARN: !GetAtt BedrockExecutionRole.Arn
+          AWS_REGION: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import io
+          import uuid
+          import os
+          import pandas as pd
+          from datetime import datetime
+          from botocore.config import Config
+
+          # Configure boto3 client with specific region and API version
+          config = Config(
+              region_name = os.environ.get('AWS_REGION', 'us-west-2'),
+              retries = dict(
+                  max_attempts = 3
+              )
+          )
+
+          s3 = boto3.client('s3')
+          bedrock = boto3.client('bedrock', config=config)
+          dynamodb = boto3.resource('dynamodb')
+          
+          def handler(event, context):
+              print("Event received:", json.dumps(event, indent=2))
+              try:
+                  # Handle both direct S3 events and EventBridge events
+                  if 'detail' in event:
+                      # EventBridge format
+                      source_bucket = event['detail']['bucket']['name']
+                      source_key = event['detail']['object']['key']
+                  elif 'Records' in event:
+                      # Direct S3 event format
+                      s3_event = event['Records'][0]['s3']
+                      source_bucket = s3_event['bucket']['name']
+                      source_key = s3_event['object']['key']
+                  else:
+                      raise ValueError("Unsupported event format")
+                  
+                  print(f"Processing file: s3://{source_bucket}/{source_key}")
+                  
+                  if not source_key.endswith('.csv'):
+                      print(f"Skipping non-CSV file: {source_key}")
+                      return
+                  
+                  # Initialize job tracking
+                  table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+                  job_id = str(uuid.uuid4())
+                  
+                  try:
+                      # Read and process the CSV file
+                      response = s3.get_object(Bucket=source_bucket, Key=source_key)
+                      csv_content = response['Body'].read().decode('utf-8')
+                      
+                      # Process the file
+                      df = pd.read_csv(io.StringIO(csv_content))
+                      records = []
+                      
+                      for _, row in df.iterrows():
+                          if pd.notna(row['Comments']):
+                              record = {
+                                  "recordId": str(row['SurveyID']),
+                                  "modelInput": {
+                                      "anthropic_version": "bedrock-2023-05-31",
+                                      "max_tokens": 1024,
+                                      "messages": [{
+                                          "role": "system",
+                                          "content": """You are a PII detection and masking system. Your task is to identify and mask personally identifiable information (PII) in input text..."""
+                                      }, {
+                                          "role": "user",
+                                          "content": str(row['Comments'])
+                                      }]
+                                  }
+                              }
+                              records.append(json.dumps(record))
+                      
+                      # Save JSONL for Bedrock
+                      jsonl_content = '\n'.join(records)
+                      timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                      batch_input_key = f"input/{timestamp}.jsonl"
+                      
+                      s3.put_object(
+                          Bucket=os.environ['INPUT_BUCKET'],
+                          Key=batch_input_key,
+                          Body=jsonl_content
+                      )
+                      
+                      try:
+                          # Create Bedrock batch job
+                          print("Available Bedrock methods:", dir(bedrock))
+                          print("Creating batch inference job...")
+                          response = bedrock.create_model_invocation_job(
+                              modelId='anthropic.claude-3-haiku-20240307-v1:0',
+                              jobName=f"pii-detection-{timestamp}",
+                              inputDataConfig={
+                                  's3InputDataConfig': {
+                                      's3Uri': f"s3://{os.environ['INPUT_BUCKET']}/{batch_input_key}"
+                                  }
+                              },
+                              outputDataConfig={
+                                  's3OutputDataConfig': {
+                                      's3Uri': f"s3://{os.environ['OUTPUT_BUCKET']}/"
+                                  }
+                              }
+                          )
+                      except AttributeError as e:
+                          print("Bedrock client API version error:", str(e))
+                          print("Available methods:", dir(bedrock))
+                          raise
+                      except Exception as e:
+                          print("Error creating batch job:", str(e))
+                          raise
+                      
+                      # Update job status
+                      table.put_item(
+                          Item={
+                              'jobId': job_id,
+                              'status': 'InProgress',
+                              'sourceFile': source_key,
+                              'sourceBucket': source_bucket,
+                              'inputLocation': batch_input_key,
+                              'outputLocation': f"output/{response['jobArn'].split('/')[-1]}",
+                              'createdAt': datetime.now().isoformat(),
+                              'bedrockJobArn': response['jobArn']
+                          }
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'jobId': job_id,
+                              'status': 'InProgress'
+                          })
+                      }
+                      
+                  except Exception as e:
+                      print(f"Error processing file: {str(e)}")
+                      table.put_item(
+                          Item={
+                              'jobId': job_id,
+                              'status': 'Failed',
+                              'sourceFile': source_key,
+                              'sourceBucket': source_bucket,
+                              'createdAt': datetime.now().isoformat(),
+                              'error': str(e)
+                          }
+                      )
+                      raise
+                      
+              except Exception as e:
+                  print(f"Error processing event: {str(e)}")
+                  raise
+
+  # Monitor Function
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with Bedrock service for job status monitoring without NAT Gateway costs."
+          - id: W92
+            reason: "Reserved concurrent executions not required for this sample template as it's designed for demonstration purposes."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function requires internet access for Bedrock API calls."
+          - id: CKV_AWS_115
+            comment: "Reserved concurrent executions not required for this sample template as it's designed for demonstration purposes."
+          - id: CKV_AWS_116
+            comment: "Dead Letter Queue not required for this sample template. Production deployments should implement DLQ."
+          - id: CKV_AWS_173
+            comment: "Environment variables contain only non-sensitive configuration values (table name)."
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref JobTrackingTable
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+          
+          bedrock = boto3.client('bedrock')
+          dynamodb = boto3.resource('dynamodb')
+          import os
+          
+          def handler(event, context):
+              table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+              
+              # Get all InProgress jobs
+              response = table.query(
+                  IndexName='StatusIndex',
+                  KeyConditionExpression='#status = :status',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={':status': 'InProgress'}
+              )
+              
+              for job in response['Items']:
+                  job_status = bedrock.get_model_invocation_job(
+                      jobIdentifier=job['bedrockJobArn']
+                  )['status']
+                  
+                  if job_status != job['status']:
+                      table.update_item(
+                          Key={'jobId': job['jobId']},
+                          UpdateExpression='SET #status = :status, updatedAt = :now',
+                          ExpressionAttributeNames={'#status': 'status'},
+                          ExpressionAttributeValues={
+                              ':status': job_status,
+                              ':now': datetime.now().isoformat()
+                          }
+                      )
+
+  # SQS Dead Letter Queue for failed events
+  ProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W48
+            reason: "KMS encryption not configured for this sample template. Production deployments should implement customer-managed KMS keys."
+      checkov:
+        skip:
+          - id: CKV_AWS_27
+            comment: "SQS queue encryption not configured for this sample template. Production deployments should implement KMS encryption."
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-processor-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # EventBridge Rule
+  ProcessorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger processing for new CSV files"
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: [!Ref InputBucket]
+          object:
+            key: [{"suffix": ".csv"}]
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt ProcessorFunction.Arn
+          Id: "ProcessCSVTarget"
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+          DeadLetterConfig:
+            Arn: !GetAtt ProcessorDLQ.Arn
+
+  # EventBridge Rule for Monitor
+  MonitorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Monitor batch inference jobs"
+      ScheduleExpression: "rate(15 minutes)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt MonitorFunction.Arn
+          Id: "MonitorTarget"
+
+  # Lambda Permissions
+  ProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ProcessorFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ProcessorRule.Arn
+
+  MonitorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref MonitorFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt MonitorRule.Arn
+
+Outputs:
+  InputBucketName:
+    Description: "Name of the input S3 bucket"
+    Value: !Ref InputBucket
+
+  OutputBucketName:
+    Description: "Name of the output S3 bucket"
+    Value: !Ref OutputBucket
+
+  JobTrackingTableName:
+    Description: "Name of the DynamoDB job tracking table"
+    Value: !Ref JobTrackingTable

@@ -1,0 +1,7 @@
+pandas==2.2.0
+numpy==1.26.3
+pytz>=2024.1
+python-dateutil>=2.8.2
+tzdata>=2024.1
+pydantic>=2.6.0
+pydantic-core>=2.33.0

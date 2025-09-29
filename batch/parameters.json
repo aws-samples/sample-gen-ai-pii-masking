@@ -1,0 +1,16 @@
+{
+    "Parameters": {
+      "StackName": "pii-detection-pipeline",
+      "Environment": "prod",
+      "RetentionDays": "30",
+      "CostCenter": "data-processing",
+      "Project": "pii-detection",
+      "Owner": "data-security-team"
+    },
+    "Tags": {
+      "Application": "PII-Detection-Pipeline",
+      "SecurityCompliance": "HIPAA-HITECH",
+      "DataClassification": "Confidential",
+      "AutomatedBy": "CloudFormation"
+    }
+  }

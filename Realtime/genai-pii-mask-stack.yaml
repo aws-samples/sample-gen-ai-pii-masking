@@ -1,0 +1,746 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Step Functions workflow for PII detection and masking with existing S3 bucket'
+
+Parameters:
+  ExistingBucketName:
+    Type: String
+    Description: Name of the existing S3 bucket
+  
+  RegionName:
+    Type: String
+    Default: us-east-1
+    Description: Region for Bedrock runtime
+
+Resources:
+  # Custom Resource Lambda Role
+  NotificationResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !Sub arn:aws:s3:::${ExistingBucketName}
+
+  # Custom Resource Lambda Function
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to configure S3 bucket notifications without additional networking costs."
+          - id: W92
+            reason: "Reserved concurrent executions not required for custom resource Lambda that runs only during stack deployment/update operations."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function needs internet access for S3 API calls."
+          - id: CKV_AWS_115
+            comment: "Reserved concurrent executions not required for custom resource Lambda that runs only during stack deployment/update operations."
+          - id: CKV_AWS_116
+            comment: "Dead Letter Queue not required for custom resource Lambda as failures are handled by CloudFormation stack rollback mechanism."
+          - id: CKV_AWS_173
+            comment: "Environment variables not used by this custom resource Lambda function."
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationResourceRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['BucketName']
+                      notification_configuration = {
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'LambdaFunctionArn': event['ResourceProperties']['LambdaArn'],
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {
+                                                  'Name': 'prefix',
+                                                  'Value': 'Newfile/'
+                                              }
+                                          ]
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration=notification_configuration
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Runtime: python3.10
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python310:23
+      Timeout: 60
+      Tags:
+        - Key: genai
+          Value: true
+        - Key: PII
+          Value: true
+        - Key: prod
+          Value: true
+
+  # Trigger Lambda Role
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-*'
+
+  # Processing Lambda Role
+  ProcessingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: 
+                  - !Sub arn:aws:s3:::${ExistingBucketName}/*
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/us.amazon.nova-lite-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+
+  # Lambda Function to Start Step Functions
+  # Dead Letter Queue for Lambda functions
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-lambda-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  StepFunctionsTrigger:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with Step Functions service without NAT Gateway costs."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function needs internet access for Step Functions API calls."
+          - id: CKV_AWS_115
+            comment: "ReservedConcurrentExecutions already configured (5) to prevent resource exhaustion."
+          - id: CKV_AWS_116
+            comment: "DeadLetterConfig already configured with LambdaDLQ for error handling."
+          - id: CKV_AWS_173
+            comment: "Environment variables not encrypted as they only contain ARN references which are not sensitive data."
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          
+          step_functions = boto3.client('stepfunctions')
+          
+          def lambda_handler(event, context):
+              try:
+                  record = event['Records'][0]
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  if not key.startswith('Newfile/'):
+                      return {
+                          'statusCode': 200,
+                          'body': 'File not in Newfile directory, skipping'
+                      }
+                  
+                  response = step_functions.start_execution(
+                      stateMachineArn = os.environ['STATE_MACHINE_ARN'],
+                      input = json.dumps({
+                          'bucket': bucket,
+                          'key': key
+                      })
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': f'Started execution: {response["executionArn"]}'
+                  }
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error starting execution: {str(e)}'
+                  }
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref PIIProcessingStateMachine
+      Tags:
+        - Key: genai
+          Value: true
+        - Key: PII
+          Value: true
+        - Key: prod
+          Value: true
+
+  # Lambda Permission for S3
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StepFunctionsTrigger
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${ExistingBucketName}'
+
+  # Configure S3 Bucket Notification using Custom Resource
+  ConfigureBucketNotification:
+    Type: Custom::S3BucketNotification
+    DependsOn: S3InvokeLambdaPermission
+    Properties:
+      ServiceToken: !GetAtt NotificationFunction.Arn
+      BucketName: !Ref ExistingBucketName
+      LambdaArn: !GetAtt StepFunctionsTrigger.Arn
+
+  # Lambda Function for CSV Loading
+  LoadCSVFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with S3 service for data processing without NAT Gateway costs."
+          - id: W92
+            reason: "Reserved concurrent executions not required for CSV loading function as it's controlled by Step Functions execution limits."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function needs internet access for S3 API calls."
+          - id: CKV_AWS_115
+            comment: "Reserved concurrent executions not required for CSV loading function as it's controlled by Step Functions execution limits."
+          - id: CKV_AWS_116
+            comment: "Dead Letter Queue not required as function is invoked by Step Functions which provides built-in error handling and retry mechanisms."
+          - id: CKV_AWS_173
+            comment: "Environment variables not used by this Lambda function."
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessingLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import pandas as pd
+          import io
+          import json
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              source_bucket = event['bucket']
+              source_key = event['key']
+              
+              try:
+                  logger.info(f"Starting to process file {source_key} from bucket {source_bucket}")
+                  
+                  logger.info("Retrieving file from S3")
+                  obj = s3.get_object(Bucket=source_bucket, Key=source_key)
+                  
+                  logger.info("Reading CSV file into DataFrame")
+                  df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+                  logger.info(f"Successfully loaded CSV with {len(df)} rows and {len(df.columns)} columns")
+                  
+                  # Verify Comments column exists
+                  if 'Comments' not in df.columns:
+                      raise ValueError("CSV file must contain a 'Comments' column")
+                  
+                  logger.info("Splitting DataFrame into chunks")
+                  chunk_size = 100
+                  chunks = []
+                  for i in range(0, len(df), chunk_size):
+                      chunk_df = df[i:i + chunk_size]
+                      # Only include necessary columns to reduce payload size
+                      minimal_chunk = chunk_df[['Comments']].copy()
+                      chunks.append(minimal_chunk.to_json())
+                      logger.info(f"Created chunk {len(chunks)} with {len(chunk_df)} rows")
+                  
+                  return {
+                      'statusCode': 200,
+                      'chunks': chunks,
+                      'total_chunks': len(chunks),
+                      'source_key': source_key,
+                      'bucket': source_bucket
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'error': str(e)
+                  }
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Tags:
+        - Key: genai
+          Value: true
+        - Key: PII
+          Value: true
+        - Key: prod
+          Value: true
+
+# Lambda Function for PII Detection
+  PIIDetectionFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with Bedrock service for AI model inference without NAT Gateway costs."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function needs internet access for Bedrock API calls."
+          - id: CKV_AWS_115
+            comment: "ReservedConcurrentExecutions already configured (5) to prevent resource exhaustion."
+          - id: CKV_AWS_116
+            comment: "Dead Letter Queue not required as function is invoked by Step Functions which provides built-in error handling and retry mechanisms."
+          - id: CKV_AWS_173
+            comment: "Environment variables not used by this Lambda function."
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessingLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import pandas as pd
+          import json
+          import time
+          import logging
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+          from botocore.config import Config
+          import random
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize bedrock with retry configuration
+          bedrock = boto3.client(
+              'bedrock-runtime', 
+              region_name='us-east-1',
+              config=Config(
+                  retries=dict(
+                      max_attempts=10,
+                      mode='adaptive'  # Uses exponential backoff with jitter
+                  )
+              )
+          )
+
+          def log_dataframe_info(df, stage):
+              """Log DataFrame information at various stages"""
+              logger.info(f"{stage} - DataFrame info:")
+              logger.info(f"Number of rows: {len(df)}")
+              logger.info(f"Number of null values in Comments: {df['Comments'].isnull().sum()}")
+              logger.info(f"Number of non-null values in Comments: {df['Comments'].notnull().sum()}")
+
+          def exponential_backoff(attempt, max_delay=32):
+              """Calculate exponential backoff time with jitter"""
+              delay = min(max_delay, pow(2, attempt))
+              jitter = random.uniform(0, 0.1 * delay)  # 10% jitter
+              return delay + jitter
+
+          def obfuscate_pii_with_retries(text, max_retries=5):
+              """Wrapper function to add retry logic to PII detection"""
+              attempt = 0
+              last_exception = None
+              
+              while attempt < max_retries:
+                  try:
+                      return obfuscate_pii(text)
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'ThrottlingException':
+                          attempt += 1
+                          if attempt < max_retries:
+                              delay = exponential_backoff(attempt)
+                              logger.warning(f"Throttling encountered, attempt {attempt}/{max_retries}. "
+                                         f"Retrying in {delay:.2f} seconds...")
+                              time.sleep(delay)
+                              last_exception = e
+                              continue
+                          logger.error(f"Max retries ({max_retries}) reached for throttling")
+                      raise e
+                  except Exception as e:
+                      logger.error(f"Error in PII detection: {str(e)}")
+                      return text
+              
+              if last_exception:
+                  raise last_exception
+              return text
+
+          def obfuscate_pii(text):
+              try:
+                  prompt = """You are a PII detection and masking system. Your task is to identify and mask personally identifiable information (PII) in input text.
+                  When you detect PII, replace it with a corresponding PII entity type tag.  
+                  Use the following masking tags: 
+                  - Credit card numbers: <PII_CREDIT_CARD> 
+                  - Names: <PII_NAME>
+                  - Email addresses: <PII_EMAIL> 
+                  - Street/postal addresses: <PII_ADDRESS> 
+                  - Phone numbers: <PII_PHONE> - Bank account numbers: <PII_BANK_ACCOUNT> 
+                  - Government IDs (SSN, driver's license, passport, etc): <PII_GOV_ID> 
+                  - Dates of birth: <PII_DOB> - Geolocation coordinates: <PII_GEOLOCATION> 
+                  - Organization account numbers: <PII_ORG_ACCOUNT> 
+                  - Associated IDs (airline, car rental, etc): <PII_ASSOCIATED_ID> 
+                  - Digital signatures (IP, MAC, Device ID, etc): <PII_DIGITAL_SIG>
+                  - Health/medical information: <PII_MEDICAL>  
+                  - Passwords: <PII_PASSWORD> 
+                  Guidelines: 
+                  1. Analyze the input text and identify any PII elements 
+                  2. Replace each PII element with its corresponding mask tag 
+                  3. Preserve the original text structure and formatting 
+                  4. Return only the masked text without any additional commentary 
+                  5. Process text in-place, maintaining original word order and punctuation 
+                  6. Be thorough in detecting PII across different formats and patterns 
+                  7. Handle partial or incomplete PII data conservatively 
+                  8. Maintain case sensitivity of non-PII text 
+                  9. Preserve spacing and line breaks 
+                  10. Do not add any explanations or metadata to the output  
+                  Remember: Your output should contain only the masked text, with no additional commentary, formatting, or explanations."""
+                  
+                  response = bedrock.converse(
+                      modelId='us.amazon.nova-lite-v1:0',
+                      messages=[{
+                          'role': 'user',
+                          'content': [{ 
+                              'text': f"{prompt} + Text to analyze: {text}"
+                          }]
+                      }]
+                  )
+                  logger.info(f"Bedrock response: {response}")
+                  return response['output']['message']['content'][0]['text']
+              except Exception as e:
+                  logger.error(f"Error in PII detection: {str(e)}")
+                  return text
+
+          def process_dataframe(df):
+              """Process DataFrame without rate limiting"""
+              processed_df = df.copy()
+              log_dataframe_info(processed_df, "Before Processing")
+              
+              total_rows = len(processed_df)
+              processed_count = 0
+              skipped_count = 0
+              
+              for index, row in processed_df.iterrows():
+                  if pd.notna(row['Comments']):
+                      logger.info(f"Processing row {index} ({processed_count + 1}/{total_rows})")
+                      try:
+                          processed_df.loc[index, 'Comments'] = obfuscate_pii_with_retries(row['Comments'])
+                          processed_count += 1
+                          if processed_count % 10 == 0:
+                              logger.info(f"Progress: {processed_count}/{total_rows} rows processed")
+                      except Exception as e:
+                          logger.error(f"Error processing row {index}: {str(e)}")
+                  else:
+                      skipped_count += 1
+              
+              logger.info(f"Processing complete. Processed: {processed_count}, Skipped: {skipped_count}")
+              log_dataframe_info(processed_df, "After Processing")
+              return processed_df
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info("Starting PII detection process")
+                  
+                  # If event is a string, parse it
+                  if isinstance(event, str):
+                      event = json.loads(event)
+                  
+                  # Get the Comments field and ensure it's properly parsed
+                  comments_data = event.get('Comments', {})
+                  if isinstance(comments_data, str):
+                      comments_data = json.loads(comments_data)
+                  
+                  # Create DataFrame directly from the Comments dictionary
+                  df = pd.DataFrame.from_dict(comments_data, orient='index', columns=['Comments'])
+                  df = df.reset_index().rename(columns={'index': 'id'})
+                  
+                  logger.info(f"Processing Comments with {len(df)} rows")
+                  logger.info(f"DataFrame columns: {df.columns}")
+                  logger.info(f"First few rows: {df.head()}")
+                  
+                  processed_df = process_dataframe(df)
+                  
+                  # Convert back to the original format
+                  result_dict = {
+                      'Comments': processed_df.set_index('id')['Comments'].to_dict()
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'processed_Comments': json.dumps(result_dict)
+                  }
+              except Exception as e:
+                  logger.error(f"Error in lambda_handler: {str(e)}")
+                  logger.error(f"Event type: {type(event)}")
+                  logger.error(f"Event content: {str(event)[:200]}")  # Log first 200 chars
+                  return {
+                      'statusCode': 500,
+                      'error': str(e)
+                  }
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 5
+      Tags:
+        - Key: genai
+          Value: true
+        - Key: PII
+          Value: true
+        - Key: prod
+          Value: true
+
+  # Lambda Function for Merging Results
+  MergeResultsFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda function does not require VPC configuration. Function needs internet access to communicate with S3 service for result aggregation without NAT Gateway costs."
+          - id: W92
+            reason: "Reserved concurrent executions not required for merge function as it's controlled by Step Functions execution limits."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda function intentionally not deployed in VPC to avoid additional networking costs and complexity. Function needs internet access for S3 API calls."
+          - id: CKV_AWS_115
+            comment: "Reserved concurrent executions not required for merge function as it's controlled by Step Functions execution limits."
+          - id: CKV_AWS_116
+            comment: "Dead Letter Queue not required as function is invoked by Step Functions which provides built-in error handling and retry mechanisms."
+          - id: CKV_AWS_173
+            comment: "Environment variables not used by this Lambda function."
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessingLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import pandas as pd
+          import io
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info("Starting merge operation")
+                  chunks = event['chunks']
+                  source_key = event['source_key']
+                  bucket = event['bucket']
+                  
+                  logger.info(f"Processing {len(chunks)} chunks for file {source_key}")
+                  
+                  # Get original CSV to preserve all columns
+                  logger.info("Reading original CSV file")
+                  original_obj = s3.get_object(Bucket=bucket, Key=source_key)
+                  original_df = pd.read_csv(io.BytesIO(original_obj['Body'].read()))
+                  
+                  # Process chunks that contain only Comments
+                  processed_comments = []
+                  for i, chunk in enumerate(chunks):
+                      logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+                      try:
+                          chunk_df = pd.read_json(chunk)
+                          processed_comments.append(chunk_df['Comments'])
+                          logger.info(f"Successfully processed chunk {i+1} with {len(chunk_df)} rows")
+                      except Exception as e:
+                          logger.error(f"Error processing chunk {i+1}: {str(e)}")
+                  
+                  # Combine all processed comments
+                  all_comments = pd.concat(processed_comments)
+                  
+                  # Update original DataFrame with processed comments
+                  original_df['Comments'] = all_comments
+                  
+                  # Save to S3
+                  target_key = source_key.replace('Newfile/', 'Newoutputfile/')
+                  logger.info(f"Saving final result to {target_key}")
+                  csv_buffer = io.StringIO()
+                  original_df.to_csv(csv_buffer, index=False)
+                  
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=target_key,
+                      Body=csv_buffer.getvalue()
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'output_file': target_key
+                  }
+              except Exception as e:
+                  logger.error(f"Error in merge operation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e)
+                  }
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Tags:
+        - Key: genai
+          Value: true
+        - Key: PII
+          Value: true
+        - Key: prod
+          Value: true
+
+  # Step Functions State Machine
+  PIIProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+      Definition:
+        StartAt: LoadCSV
+        States:
+          LoadCSV:
+            Type: Task
+            Resource: !GetAtt LoadCSVFunction.Arn
+            Next: ProcessChunks
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: FailState
+          
+          ProcessChunks:
+            Type: Map
+            ItemsPath: "$.chunks"
+            MaxConcurrency: 8
+            Iterator:
+              StartAt: DetectPII
+              States:
+                DetectPII:
+                  Type: Task
+                  Resource: !GetAtt PIIDetectionFunction.Arn
+                  End: true
+            Next: MergeResults
+            
+          MergeResults:
+            Type: Task
+            Resource: !GetAtt MergeResultsFunction.Arn
+            End: true
+            
+          FailState:
+            Type: Fail
+            Cause: "Processing Error"
+      Tags:
+        - Key: genai
+          Value: true
+        - Key: PII
+          Value: true
+        - Key: prod
+          Value: true
+
+  # States Execution Role
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt LoadCSVFunction.Arn
+                  - !GetAtt PIIDetectionFunction.Arn
+                  - !GetAtt MergeResultsFunction.Arn
+
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions State Machine
+    Value: !Ref PIIProcessingStateMachine
