@@ -3,7 +3,7 @@
 Automated AWS solution for detecting and masking Personally Identifiable Information (PII) in CSV files using Step Functions, Lambda, and Amazon Bedrock.
 
 ## Architecture
-![Alt text](/images/Architeture.png)
+![Architecture Diagram](images/Architeture.png)
 
 ### Workflow Overview
 
