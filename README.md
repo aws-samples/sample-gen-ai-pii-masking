@@ -69,6 +69,7 @@ Both solutions detect and mask:
 - **Phone numbers** → `<PII_PHONE>`
 - **Credit card numbers** → `<PII_CREDIT_CARD>`
 - **Social Security Numbers** → `<PII_SSN>`
+- **Passport numbers** → `<PII_PASSPORT>`
 - **Names and addresses** → Appropriate PII tags
 - **Bank account numbers** → `<PII_BANK_ACCOUNT>`
 - **Government IDs** → `<PII_GOV_ID>`
